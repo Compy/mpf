@@ -561,6 +561,7 @@ SW-16 boards found:
         self.pinproc.get_events = MagicMock(return_value=[])
 
     def _test_accelerometer(self):
+        self.wait_for_platform()
         # verify init
         self.pinproc.write_data.assert_has_calls([
             call(6, 0x0000, 0x000F),

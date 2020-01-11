@@ -75,6 +75,9 @@ class ProcProcess:
         self.stop_future = None
         self.trace = None
         self.log = None
+        self.queue = None
+        self.result_queue = None
+        self.bus_lock = None
 
     def start_pinproc(self, machine_type, loop, trace, log):
         """Initialise libpinproc."""
@@ -82,6 +85,9 @@ class ProcProcess:
         self.stop_future = asyncio.Future(loop=self.loop)
         self.trace = trace
         self.log = log
+        self.queue = asyncio.Queue(loop=self.loop)
+        self.result_queue = asyncio.Queue(loop=self.loop)
+        self.bus_lock = asyncio.Lock(loop=self.loop)
         while not self.proc:
             try:
                 self.proc = pinproc.PinPROC(machine_type)
@@ -89,6 +95,19 @@ class ProcProcess:
             except IOError:     # pragma: no cover
                 print("Retrying...")
                 time.sleep(1)
+
+    async def run(self):
+        """Run process."""
+        while not self.stop_future.done():
+            cmd, args, wait_for_response = await self.queue.get()
+            if cmd.startswith("_"):
+                result = getattr(self, cmd)(*args)
+            else:
+                result = getattr(self.proc, cmd)(*args)
+                if self.trace:
+                    self.log.debug("pinproc.PinPROC.%s%s -> %s", cmd, args, result)
+            if wait_for_response:
+                self.result_queue.put_nowait(result)
 
     def start_proc_process(self, machine_type, loop, trace, log):
         """Run the pinproc communication."""
@@ -105,17 +124,14 @@ class ProcProcess:
     def _sync(num):
         return "sync", num
 
-    async def run_command(self, cmd, *args):
+    async def run_command(self, cmd, *args, wait_for_result):
         """Run command in proc thread."""
-        if cmd.startswith("_"):
-            return getattr(self, cmd)(*args)
-
-        if self.trace:
-            result = getattr(self.proc, cmd)(*args)
-            self.log.debug("pinproc.PinPROC.%s%s -> %s", cmd, args, result)
-            return result
-
-        return getattr(self.proc, cmd)(*args)
+        if wait_for_result:
+            async with self.bus_lock:
+                self.queue.put_nowait((cmd, args, True))
+                return await self.result_queue.get()
+        else:
+            self.queue.put_nowait((cmd, args, False))
 
     def _dmd_send(self, data):
         if not self.dmd:
@@ -125,16 +141,13 @@ class ProcProcess:
         self.dmd.set_data(data)
         self.proc.dmd_draw(self.dmd)
 
-    async def read_events_and_watchdog(self, poll_sleep):
+    def _read_events_and_watchdog(self):
         """Return all events and tickle watchdog."""
-        while not self.stop_future.done():
-            events = self.proc.get_events()
-            self.proc.watchdog_tickle()
-            self.proc.flush()
-            if events:
-                return list(events)
-
-            await asyncio.sleep(poll_sleep, loop=self.loop)
+        events = self.proc.get_events()
+        self.proc.watchdog_tickle()
+        self.proc.flush()
+        if events:
+            return list(events)
 
         return []
 
@@ -201,23 +214,24 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
         del future
         self._commands_running -= 1
 
-    def run_proc_cmd(self, cmd, *args):
+    def run_proc_cmd(self, cmd, *args, wait_for_result=True):
         """Run a command in the p-roc thread and return a future."""
         if self.debug:
             self.debug_log("Calling P-Roc cmd: %s (%s)", cmd, args)
         future = asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(self.proc_process.run_command(cmd, *args), self.proc_process_instance),
+            asyncio.run_coroutine_threadsafe(self.proc_process.run_command(
+                cmd, *args, wait_for_result=wait_for_result), self.proc_process_instance),
             loop=self.machine.clock.loop)
         future.add_done_callback(self._done)
         return future
 
     def run_proc_cmd_no_wait(self, cmd, *args):
         """Run a command in the p-roc thread."""
-        self.run_proc_cmd(cmd, *args)
+        self.run_proc_cmd(cmd, *args, wait_for_result=False)
 
     def run_proc_cmd_sync(self, cmd, *args):
         """Run a command in the p-roc thread and return the result."""
-        return self.machine.clock.loop.run_until_complete(self.run_proc_cmd(cmd, *args))
+        return self.machine.clock.loop.run_until_complete(self.run_proc_cmd(cmd, *args, wait_for_result=True))
 
     async def initialize(self):
         """Set machine vars."""
@@ -282,10 +296,7 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
     async def _poll_events(self):
         poll_sleep = 1 / self.machine.config['mpf']['default_platform_hz']
         while True:
-            events = await asyncio.wrap_future(
-                asyncio.run_coroutine_threadsafe(self.proc_process.read_events_and_watchdog(poll_sleep),
-                                                 self.proc_process_instance),
-                loop=self.machine.clock.loop)
+            events = await self.run_proc_cmd("_read_events_and_watchdog")
             if events:
                 self.process_events(events)
 
@@ -321,6 +332,9 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
             self.proc_process.start_pinproc(loop=self.machine.clock.loop, machine_type=self.machine_type,
                                             trace=self.config['trace_bus'] and self.config['debug'],
                                             log=self.log)
+
+        run = asyncio.run_coroutine_threadsafe(self.proc_process.run(), loop=self.proc_process_instance)
+        run.add_done_callback(self._done)
 
     async def connect(self):
         """Connect to the P-ROC.
