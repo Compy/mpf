@@ -1,8 +1,7 @@
 """A light system for platforms which batches all updates."""
 import abc
 import asyncio
-from typing import Callable, Tuple, Set
-from sortedcontainers import SortedSet, SortedList
+from typing import Callable, Tuple
 from mpf.platforms.interfaces.light_platform_interface import LightPlatformInterface
 
 
@@ -51,8 +50,8 @@ class PlatformBatchLightSystem:
     # pylint: disable-msg=too-many-arguments
     def __init__(self, clock, sort_function, is_sequential_function, update_callback, update_hz, max_batch_size):
         """Initialise light system."""
-        self.dirty_lights = SortedSet(key=sort_function)    # type: Set[PlatformBatchLight]
-        self.dirty_schedule = SortedList(key=lambda x: x[0] + sort_function(x[1]))
+        self.dirty_lights = []    # type: List[PlatformBatchLight]
+        self.dirty_schedule = []
         self.is_sequential_function = is_sequential_function
         self.sort_function = sort_function
         self.update_task = None
@@ -81,12 +80,21 @@ class PlatformBatchLightSystem:
 
     async def _send_updates(self):
         while True:
+            if self.dirty_schedule:
+                sorted(self.dirty_schedule, key=lambda x: x[0] + self.sort_function(x[1]))
             while self.dirty_schedule and self.dirty_schedule[0][0] <= self.clock.get_time():
-                self.dirty_lights.add(self.dirty_schedule[0][1])
+                self.dirty_lights.append(self.dirty_schedule[0][1])
                 del self.dirty_schedule[0]
 
+            if self.dirty_lights:
+                sorted(self.dirty_lights, key=self.sort_function)
+
             sequential_lights = []
-            for light in list(self.dirty_lights):
+            last_light = None
+            for light in self.dirty_lights:
+                if light == last_light:
+                    continue
+                last_light = light
                 if not sequential_lights:
                     # first light
                     sequential_lights = [light]
@@ -113,7 +121,7 @@ class PlatformBatchLightSystem:
         for light in sequential_lights:
             brightness, fade_ms, done = light.get_fade_and_brightness(current_time)
             if not done:
-                self.dirty_schedule.add((current_time + (fade_ms / 1000), light))
+                self.dirty_schedule.append((current_time + (fade_ms / 1000), light))
             if common_fade_ms is None:
                 common_fade_ms = fade_ms
 
@@ -131,6 +139,4 @@ class PlatformBatchLightSystem:
 
     def mark_dirty(self, light: "PlatformBatchLight"):
         """Mark as dirty."""
-        self.dirty_lights.add(light)
-        self.dirty_schedule = SortedList([x for x in self.dirty_schedule if x[1] != light],
-                                         key=lambda x: x[0] + self.sort_function(x[1]))
+        self.dirty_lights.append(light)
