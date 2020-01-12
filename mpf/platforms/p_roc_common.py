@@ -3,13 +3,16 @@
 import abc
 import asyncio
 import logging
+from multiprocessing import JoinableQueue
+
 import platform
 import sys
 from collections import defaultdict
-from threading import Thread
 
 import time
 from typing import Any, List, Union
+
+import janus
 
 from mpf.core.platform_batch_light_system import PlatformBatchLightSystem
 from mpf.platforms.interfaces.servo_platform_interface import ServoPlatformInterface
@@ -63,93 +66,48 @@ except ImportError:     # pragma: no cover
         IMPORT_ERROR = e
 
 
-class ProcProcess:
+def proc_thread(send_queue, result_queue):
+    """Separate thread for pypinproc."""
+    machine_type = 7
+    proc = None
+    dmd = None
+    while not proc:
+        try:
+            proc = pinproc.PinPROC(machine_type)
+            proc.reset(1)
+        except IOError:  # pragma: no cover
+            print("Retrying...")
+            time.sleep(1)
 
-    """External pinproc process."""
+    while not result_queue.closed:
+        cmd, args, wait_for_response = send_queue.get()
 
-    def __init__(self):
-        """Initialise process."""
-        self.proc = None
-        self.dmd = None
-        self.loop = None
-        self.stop_future = None
-        self.trace = None
-        self.log = None
-        self.queue = None
-        self.result_queue = None
-        self.bus_lock = None
-
-    def start_pinproc(self, machine_type, loop, trace, log):
-        """Initialise libpinproc."""
-        self.loop = loop
-        self.stop_future = asyncio.Future(loop=self.loop)
-        self.trace = trace
-        self.log = log
-        self.queue = asyncio.Queue(loop=self.loop)
-        self.result_queue = asyncio.Queue(loop=self.loop)
-        self.bus_lock = asyncio.Lock(loop=self.loop)
-        while not self.proc:
-            try:
-                self.proc = pinproc.PinPROC(machine_type)
-                self.proc.reset(1)
-            except IOError:     # pragma: no cover
-                print("Retrying...")
-                time.sleep(1)
-
-    async def run(self):
-        """Run process."""
-        while not self.stop_future.done():
-            cmd, args, wait_for_response = await self.queue.get()
-            if cmd.startswith("_"):
-                result = getattr(self, cmd)(*args)
+        if cmd == "_read_events_and_watchdog":
+            events = proc.get_events()
+            proc.watchdog_tickle()
+            proc.flush()
+            if events:
+                result = list(events)
             else:
-                result = getattr(self.proc, cmd)(*args)
-                if self.trace:
-                    self.log.debug("pinproc.PinPROC.%s%s -> %s", cmd, args, result)
-            if wait_for_response:
-                self.result_queue.put_nowait(result)
+                result = []
+        elif cmd == "_sync":
+            result = ("sync", args[0])
+        elif cmd == "_dmd_send":
+            if not dmd:
+                # size is hardcoded here since 128x32 is all the P-ROC hw supports
+                dmd = pinproc.DMDBuffer(128, 32)
 
-    def start_proc_process(self, machine_type, loop, trace, log):
-        """Run the pinproc communication."""
-        self.start_pinproc(machine_type, loop, trace, log)
-
-        loop.run_until_complete(self.stop_future)
-        loop.close()
-
-    def stop(self):
-        """Stop thread."""
-        self.stop_future.set_result(True)
-
-    @staticmethod
-    def _sync(num):
-        return "sync", num
-
-    async def run_command(self, cmd, *args, wait_for_result):
-        """Run command in proc thread."""
-        if wait_for_result:
-            async with self.bus_lock:
-                self.queue.put_nowait((cmd, args, True))
-                return await self.result_queue.get()
+            dmd.set_data(args[0])
+            proc.dmd_draw(dmd)
+            result = True
+        elif cmd == "_exit":
+            break
         else:
-            self.queue.put_nowait((cmd, args, False))
-
-    def _dmd_send(self, data):
-        if not self.dmd:
-            # size is hardcoded here since 128x32 is all the P-ROC hw supports
-            self.dmd = pinproc.DMDBuffer(128, 32)
-
-        self.dmd.set_data(data)
-        self.proc.dmd_draw(self.dmd)
-
-    def _read_events_and_watchdog(self):
-        """Return all events and tickle watchdog."""
-        events = self.proc.get_events()
-        self.proc.watchdog_tickle()
-        self.proc.flush()
-        if events:
-            return list(events)
-
-        return []
+            result = getattr(proc, cmd)(*args)
+            # if self.trace:
+            #     self.log.debug("pinproc.PinPROC.%s%s -> %s", cmd, args, result)
+        if wait_for_response:
+            result_queue.put_nowait(result)
 
 
 class PdLedStatus:
@@ -178,7 +136,8 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
 
     __slots__ = ["pdbconfig", "pinproc", "proc", "log", "hw_switch_rules", "version", "revision", "hardware_version",
                  "dipswitches", "machine_type", "event_task", "pdled_state",
-                 "proc_thread", "proc_process", "proc_process_instance", "_commands_running", "config", "_light_system"]
+                 "proc_thread", "_commands_running", "config", "_light_system",
+                 "result_queue", "send_queue", "bus_lock"]
 
     def __init__(self, machine):
         """Make sure pinproc was loaded."""
@@ -200,12 +159,13 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
         self.dipswitches = None
         self.event_task = None
         self.proc_thread = None
-        self.proc_process = None
-        self.proc_process_instance = None
         self._commands_running = 0
         self.config = {}
         self.pdled_state = defaultdict(PdLedStatus)
         self._light_system = None
+        self.result_queue = None
+        self.send_queue = None
+        self.bus_lock = None
 
         self.machine_type = pinproc.normalize_machine_type(
             self.machine.config['hardware']['driverboards'])
@@ -214,24 +174,23 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
         del future
         self._commands_running -= 1
 
-    def run_proc_cmd(self, cmd, *args, wait_for_result=True):
+    async def run_proc_cmd(self, cmd, *args):
         """Run a command in the p-roc thread and return a future."""
         if self.debug:
             self.debug_log("Calling P-Roc cmd: %s (%s)", cmd, args)
-        future = asyncio.wrap_future(
-            asyncio.run_coroutine_threadsafe(self.proc_process.run_command(
-                cmd, *args, wait_for_result=wait_for_result), self.proc_process_instance),
-            loop=self.machine.clock.loop)
-        future.add_done_callback(self._done)
-        return future
+        async with self.bus_lock:
+            self.send_queue.put_nowait((cmd, args, True))
+            result = await self.result_queue.async_q.get()
+
+        return result
 
     def run_proc_cmd_no_wait(self, cmd, *args):
         """Run a command in the p-roc thread."""
-        self.run_proc_cmd(cmd, *args, wait_for_result=False)
+        self.send_queue.put_nowait((cmd, args, False))
 
     def run_proc_cmd_sync(self, cmd, *args):
         """Run a command in the p-roc thread and return the result."""
-        return self.machine.clock.loop.run_until_complete(self.run_proc_cmd(cmd, *args, wait_for_result=True))
+        return self.machine.clock.loop.run_until_complete(self.run_proc_cmd(cmd, *args))
 
     async def initialize(self):
         """Set machine vars."""
@@ -304,37 +263,24 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
 
     def stop(self):
         """Stop proc."""
+        if self.event_task:
+            self.event_task.cancel()
+            self.event_task = None
         if self._light_system:
             self._light_system.stop()
-        if self.proc_process and self.proc_process_instance:
-            self.proc_process_instance.call_soon_threadsafe(self.proc_process.stop)
+        if self.result_queue:
+            self.result_queue.async_q.task_done()
+        if self.send_queue:
+            self.send_queue.put_nowait(("_exit", (), False))
         if self.proc_thread:
-            self.debug_log("Waiting for pinproc thread.")
-            self.proc_thread.join()
-            self.proc_thread = None
-            self.debug_log("pinproc thread finished.")
+            self.machine.clock.loop.run_until_complete(self.proc_thread)
 
     def _start_proc_process(self):
-        self.proc_process = ProcProcess()
-        if self.config["use_separate_thread"]:
-            # Create a new loop
-            self.proc_process_instance = asyncio.new_event_loop()
-            # Assign the loop to another thread
-            self.proc_thread = Thread(target=self.proc_process.start_proc_process,
-                                      args=(self.machine_type, self.proc_process_instance,
-                                            self.config['trace_bus'] and self.config['debug'],
-                                            self.log))
-            self.proc_thread.start()
-
-        else:
-            # use existing loop
-            self.proc_process_instance = self.machine.clock.loop
-            self.proc_process.start_pinproc(loop=self.machine.clock.loop, machine_type=self.machine_type,
-                                            trace=self.config['trace_bus'] and self.config['debug'],
-                                            log=self.log)
-
-        run = asyncio.run_coroutine_threadsafe(self.proc_process.run(), loop=self.proc_process_instance)
-        run.add_done_callback(self._done)
+        self.send_queue = JoinableQueue()
+        self.result_queue = janus.Queue(loop=self.machine.clock.loop)
+        self.proc_thread = self.machine.clock.loop.run_in_executor(None, proc_thread, self.send_queue,
+                                                                   self.result_queue.sync_q)
+        self.bus_lock = asyncio.Lock(loop=self.machine.clock.loop)
 
     async def connect(self):
         """Connect to the P-ROC.
