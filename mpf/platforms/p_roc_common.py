@@ -66,11 +66,15 @@ except ImportError:     # pragma: no cover
         IMPORT_ERROR = e
 
 
-def proc_thread(send_queue, result_queue):
+def proc_thread(send_queue, result_queue, trace):
     """Separate thread for pypinproc."""
     machine_type = 7
     proc = None
     dmd = None
+    if trace:
+        log = logging.getLogger("PinPROC")
+        log.setLevel(logging.DEBUG)
+
     while not proc:
         try:
             proc = pinproc.PinPROC(machine_type)
@@ -86,26 +90,37 @@ def proc_thread(send_queue, result_queue):
             events = proc.get_events()
             proc.watchdog_tickle()
             proc.flush()
+            if trace:
+                log.debug("get_events() -> %s", events)
+                log.debug("watchdog_tickle()")
+                log.debug("flush()")
             if events:
                 result = list(events)
             else:
                 result = []
         elif cmd == "_sync":
+            if trace:
+                log.debug("sync(%s)", args[0])
             result = ("sync", args[0])
         elif cmd == "_dmd_send":
             if not dmd:
                 # size is hardcoded here since 128x32 is all the P-ROC hw supports
                 dmd = pinproc.DMDBuffer(128, 32)
 
+            if trace:
+                log.debug("dmd.set_data(%s)", args[0])
+                log.debug("dmd_draw")
             dmd.set_data(args[0])
             proc.dmd_draw(dmd)
             result = True
         elif cmd == "_exit":
+            if trace:
+                log.debug("Exit")
             break
         else:
             result = getattr(proc, cmd)(*args)
-            # if self.trace:
-            #     self.log.debug("pinproc.PinPROC.%s%s -> %s", cmd, args, result)
+            if trace:
+                log.debug("%s%s -> %s", cmd, args, result)
         if wait_for_response:
             result_queue.put_nowait(result)
 
@@ -279,7 +294,8 @@ class PROCBasePlatform(LightsPlatform, SwitchPlatform, DriverPlatform, ServoPlat
         self.send_queue = JoinableQueue()
         self.result_queue = janus.Queue(loop=self.machine.clock.loop)
         self.proc_thread = self.machine.clock.loop.run_in_executor(None, proc_thread, self.send_queue,
-                                                                   self.result_queue.sync_q)
+                                                                   self.result_queue.sync_q,
+                                                                   self.config['trace_bus'] and self.debug)
         self.bus_lock = asyncio.Lock(loop=self.machine.clock.loop)
 
     async def connect(self):

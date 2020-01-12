@@ -77,7 +77,7 @@ community.''',
                       'asciimatics>=1.11.0',
                       'terminaltables',
                       'psutil',
-                      'janus==0.4.0',
+                      'janus',
                       'pypiwin32>=223;platform_system=="Windows"'],
 
     tests_require=[],
